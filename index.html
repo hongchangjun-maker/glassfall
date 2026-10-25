@@ -425,22 +425,76 @@ function streak(y, n){ const f = useFx('streak'); f.active = true; f.age = 0; f.
 function ring(x, y, n){ const f = useFx('ring'); f.active = true; f.age = 0; f.life = 0.55 + 0.1 * n; f.peak = 0.6 + 0.15 * n; f.size = 7 + 3.5 * n; f.m.position.set(x, y, 0.7); f.m.visible = true; }
 
 /* ---------------- audio ---------------- */
-let AC = null, master = null, revIn = null, noiseBuf = null;
+let AC = null, out = null, master = null, revIn = null, noiseBuf = null, musicGain = null, duckGain = null;
 let muted = store.get('glassfall.muted', false);
+const MUSIC_VOL = 0.4;
+let musicRaw = null, musicBuf = null, musicSrc = null, musicOld = null, musicWant = false, musicStartAt = 0, musicOffset = 0;
+fetch('bgm.mp3').then(r => r.ok ? r.arrayBuffer() : null).then(b => { if (b){ musicRaw = b; decodeMusic(); } }).catch(() => {});
+function decodeMusic(){
+  if (!AC || !musicRaw || musicBuf) return;
+  const raw = musicRaw; musicRaw = null;
+  const okCb = b => { musicBuf = b; if (musicWant) musicPlay(musicOffset); };
+  try { const p = AC.decodeAudioData(raw, okCb, () => {}); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+}
 function initAudio(){
-  if (AC){ if (AC.state === 'suspended') AC.resume(); return; }
+  if (AC){ if (AC.state !== 'running') AC.resume(); return; }
   const Ctx = window.AudioContext || window.webkitAudioContext; if (!Ctx) return;
   AC = new Ctx();
-  const comp = AC.createDynamicsCompressor(); comp.threshold.value = -14; comp.ratio.value = 4; comp.attack.value = 0.002; comp.release.value = 0.2;
-  master = AC.createGain(); master.gain.value = muted ? 0 : 0.85;
-  master.connect(comp); comp.connect(AC.destination);
-  const len = Math.floor(AC.sampleRate * 2.6), ir = AC.createBuffer(2, len, AC.sampleRate);
-  for (let ch = 0; ch < 2; ch++){ const d = ir.getChannelData(ch); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3.2); }
+  out = AC.createGain(); out.gain.value = muted ? 0 : 1; out.connect(AC.destination);
+  const comp = AC.createDynamicsCompressor(); comp.threshold.value = -12; comp.knee.value = 8; comp.ratio.value = 4; comp.attack.value = 0.002; comp.release.value = 0.18;
+  master = AC.createGain(); master.gain.value = 0.9; master.connect(comp); comp.connect(out);
+  duckGain = AC.createGain(); duckGain.connect(out);
+  musicGain = AC.createGain(); musicGain.gain.value = 0.0001; musicGain.connect(duckGain);
+  /* glassy room: early reflections + darkening stereo tail */
+  const sr = AC.sampleRate, len = Math.floor(sr * 2.8), ir = AC.createBuffer(2, len, sr);
+  for (let ch = 0; ch < 2; ch++){
+    const d = ir.getChannelData(ch); let lp = 0;
+    for (let i = 0; i < len; i++){ const k = i / len; lp += ((Math.random() * 2 - 1) - lp) * (1 - 0.86 * k); d[i] = lp * Math.pow(1 - k, 3.4); }
+    for (let r = 0; r < 7; r++){ const idx = Math.floor(sr * rnd(0.006, 0.07)); d[idx] += rnd(0.3, 0.8) * (Math.random() < 0.5 ? -1 : 1); }
+  }
   const conv = AC.createConvolver(); conv.buffer = ir;
-  revIn = AC.createGain(); revIn.gain.value = 0.5; revIn.connect(conv); conv.connect(master);
-  noiseBuf = AC.createBuffer(1, AC.sampleRate, AC.sampleRate);
+  revIn = AC.createGain(); revIn.gain.value = 0.55; revIn.connect(conv); conv.connect(master);
+  noiseBuf = AC.createBuffer(1, sr, sr);
   const nd = noiseBuf.getChannelData(0); for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+  decodeMusic();
 }
+
+/* background music: gapless loop through Web Audio */
+function musicPlay(offset = 0){
+  musicWant = true; musicOffset = offset;
+  if (!AC || !musicBuf) return;
+  musicHalt();
+  const s = AC.createBufferSource(); s.buffer = musicBuf; s.loop = true; s.connect(musicGain);
+  const t = AC.currentTime, off = offset % musicBuf.duration;
+  musicGain.gain.cancelScheduledValues(t); musicGain.gain.setValueAtTime(0.0001, t);
+  musicGain.gain.exponentialRampToValueAtTime(MUSIC_VOL, t + (off > 0 ? 0.35 : 0.8));
+  s.start(t, off); musicSrc = s; musicStartAt = t - off;
+}
+function musicHalt(){
+  for (const s of [musicSrc, musicOld]) if (s){ try { s.stop(); } catch (e) {} try { s.disconnect(); } catch (e) {} }
+  musicSrc = musicOld = null;
+}
+function musicPause(){
+  if (!musicWant) return;
+  if (AC && musicSrc && musicBuf) musicOffset = (AC.currentTime - musicStartAt) % musicBuf.duration;
+  musicHalt();
+}
+function musicResume(){ if (musicWant) musicPlay(musicOffset); }
+function musicStop(fade = 1.8){
+  musicWant = false; musicOffset = 0;
+  if (!AC || !musicSrc) return;
+  const s = musicSrc, t = AC.currentTime; musicSrc = null; musicOld = s;
+  musicGain.gain.cancelScheduledValues(t); musicGain.gain.setValueAtTime(Math.max(0.0001, musicGain.gain.value), t);
+  musicGain.gain.exponentialRampToValueAtTime(0.0001, t + fade);
+  try { s.stop(t + fade + 0.05); } catch (e) {}
+}
+function duck(depth, hold, rel){
+  if (!AC) return; const g = duckGain.gain, t = AC.currentTime;
+  g.cancelScheduledValues(t); g.setValueAtTime(g.value, t); g.linearRampToValueAtTime(depth, t + 0.03);
+  g.setValueAtTime(depth, t + hold); g.linearRampToValueAtTime(1, t + hold + rel);
+}
+
+/* synthesis primitives */
 function route(g, o){
   let n = g;
   if (AC.createStereoPanner){ const p = AC.createStereoPanner(); p.pan.value = Math.max(-1, Math.min(1, o.pan || 0)); g.connect(p); n = p; }
@@ -449,7 +503,7 @@ function route(g, o){
 }
 function tone(type, f, t, peak, dec, o = {}){
   const osc = AC.createOscillator(); osc.type = type; osc.frequency.setValueAtTime(f, t);
-  if (o.to) osc.frequency.exponentialRampToValueAtTime(o.to, t + dec);
+  if (o.to) osc.frequency.exponentialRampToValueAtTime(o.to, t + (o.glide || dec));
   const g = AC.createGain(); g.gain.setValueAtTime(0.0001, t);
   g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + (o.a || 0.003));
   g.gain.exponentialRampToValueAtTime(0.0001, t + dec);
@@ -464,35 +518,141 @@ function noise(t, peak, dec, o = {}){
   g.gain.exponentialRampToValueAtTime(0.0001, t + dec);
   s.connect(f); f.connect(g); route(g, o); s.start(t, Math.random() * 0.5); s.stop(t + dec + 0.05);
 }
+/* struck glass: inharmonic partials of a thin glass body + contact click */
+const GLASS_R = [1, 2.32, 4.25, 6.63, 9.38], GLASS_A = [1, 0.55, 0.32, 0.18, 0.1];
+function glassHit(f, t, vol, o = {}){
+  const np = o.np || 4, dec = o.dec || 0.6, pan = o.pan || 0;
+  for (let i = 0; i < np; i++){
+    const ff = f * GLASS_R[i] * rnd(0.996, 1.004); if (ff > 15000) break;
+    tone('sine', ff, t, vol * GLASS_A[i], dec / (1 + i * 0.75), { pan, wet: o.wet ?? 0.4, a: 0.0015 });
+  }
+  if (o.click !== false) noise(t, vol * 0.55, 0.012, { f: Math.min(9000, f * 2.2), pan, wet: 0.08 });
+}
+const PIECE_F = [0, 2093, 1568, 1760, 2349, 2637, 1319, 1175, 3136, 3520];
+const PROFILES = [
+  { f: 1480, nf: 2600, bf: 5200, dec: 1.25 },  /* bottle */
+  { f: 1960, nf: 3300, bf: 6600, dec: 1.7 },   /* crystal */
+  { f: 1150, nf: 2000, bf: 4300, dec: 0.95 },  /* window pane */
+];
 const ok = () => AC && !muted && AC.state === 'running';
+let moveAlt = false, lastBump = 0, lastTick = 0;
 const SFX = {
-  move(){ if (!ok()) return; tone('sine', rnd(2300, 2600), AC.currentTime, 0.022, 0.035, { wet: 0.15 }); },
-  rotate(){ if (!ok()) return; const t = AC.currentTime; tone('sine', 2100, t, 0.04, 0.07, { to: 3100, wet: 0.3 }); tone('triangle', 4300, t + 0.015, 0.014, 0.05, { wet: 0.3 }); },
-  lock(pan){ if (!ok()) return; const t = AC.currentTime; tone('sine', 1650, t, 0.08, 0.07, { pan, wet: 0.25 }); tone('triangle', 380, t, 0.11, 0.09, { to: 220, pan, wet: 0.1 }); noise(t, 0.04, 0.03, { f: 4000, pan, wet: 0.1 }); },
-  hard(pan){ if (!ok()) return; const t = AC.currentTime; noise(t, 0.12, 0.12, { ft: 'bandpass', f: 900, fTo: 200, q: 1, pan, wet: 0.2 }); tone('sine', 160, t, 0.32, 0.18, { to: 55, pan, wet: 0.1 }); tone('sine', 1900, t, 0.07, 0.1, { pan, wet: 0.35 }); },
-  hold(){ if (!ok()) return; const t = AC.currentTime; tone('sine', 1320, t, 0.05, 0.3, { wet: 0.6 }); tone('sine', 1980, t + 0.05, 0.04, 0.35, { wet: 0.6 }); },
-  shatter(n, combo, pan, vol = 1){
+  ui(){ if (!ok()) return; glassHit(2637, AC.currentTime, 0.03, { np: 3, dec: 0.25, wet: 0.35 }); },
+  start(){
     if (!ok()) return; const t = AC.currentTime;
-    const base = 1500 * Math.pow(2, Math.min(combo, 10) / 24) * rnd(0.92, 1.08);
-    noise(t, (0.32 + 0.1 * n) * vol, 0.16 + 0.05 * n, { f: 2600, pan, wet: 0.35 });
-    noise(t, 0.25 * vol, 0.012, { f: 7000, pan, wet: 0.1 });
-    noise(t + 0.005, 0.16 * vol, 0.4 + 0.1 * n, { ft: 'bandpass', f: 5200, q: 3, pan, wet: 0.6 });
-    const ratios = [1, 1.51, 2.27, 2.96, 3.73, 4.61, 5.42];
-    for (let i = 0, k = 5 + n * 2; i < k; i++)
-      tone('sine', base * ratios[i % 7] * rnd(0.985, 1.015), t + rnd(0, 0.025), rnd(0.035, 0.08) * vol, rnd(0.5, 1.5), { pan: pan + rnd(-0.3, 0.3), wet: 0.7, dry: 0.7 });
-    for (let i = 0, k = 8 + n * 7; i < k; i++)
-      tone('triangle', rnd(2800, 8000), t + rnd(0.06, 0.55 + n * 0.12), rnd(0.01, 0.035) * vol, rnd(0.05, 0.15), { pan: rnd(-0.8, 0.8), wet: 0.5 });
-    if (n >= 2) tone('sine', 120, t, (0.1 + 0.06 * n) * vol, 0.35, { to: 40, wet: 0.2 });
-    if (n >= 4){ noise(t, 0.28, 1.4, { ft: 'bandpass', f: 1200, fTo: 9000, q: 0.8, wet: 0.8 }); tone('sine', 70, t, 0.5, 0.9, { to: 30, wet: 0.3 }); }
+    noise(t, 0.08, 0.45, { ft: 'bandpass', f: 700, fTo: 7000, q: 1.2, wet: 0.5, a: 0.2 });
+    [0, 4, 7, 12].forEach((s, i) => glassHit(1046.5 * 2 ** (s / 12), t + 0.18 + i * 0.06, 0.04, { np: 4, dec: 1.4, wet: 0.75, pan: -0.4 + i * 0.27 }));
+  },
+  spawn(){ if (!ok()) return; glassHit(rnd(4200, 5200), AC.currentTime, 0.005, { np: 1, dec: 0.1, click: false, wet: 0.4 }); },
+  move(){
+    if (!ok()) return; moveAlt = !moveAlt;
+    glassHit(moveAlt ? 2490 : 2790, AC.currentTime, 0.013, { np: 2, dec: 0.06, wet: 0.12 });
+  },
+  bump(){
+    const now = performance.now(); if (!ok() || now - lastBump < 160) return; lastBump = now;
+    const t = AC.currentTime;
+    tone('sine', 300, t, 0.07, 0.07, { to: 170, wet: 0.05 });
+    noise(t, 0.04, 0.035, { ft: 'lowpass', f: 1100, wet: 0.05 });
+  },
+  tick(){
+    const now = performance.now(); if (!ok() || now - lastTick < 40) return; lastTick = now;
+    glassHit(rnd(3500, 3900), AC.currentTime, 0.006, { np: 1, dec: 0.035, click: false, wet: 0.05 });
+  },
+  rotate(dir){
+    if (!ok()) return; const t = AC.currentTime;
+    noise(t, 0.035, 0.08, { ft: 'bandpass', f: dir > 0 ? 2400 : 6000, fTo: dir > 0 ? 6200 : 2400, q: 1.6, wet: 0.2 });
+    glassHit(rnd(3000, 3400), t + 0.012, 0.02, { np: 2, dec: 0.14, wet: 0.3, click: false });
+  },
+  lock(pan, type){
+    if (!ok()) return; const t = AC.currentTime;
+    glassHit(PIECE_F[type] || 2000, t, 0.05, { np: 4, dec: 0.5, pan, wet: 0.35 });
+    tone('sine', 230, t, 0.09, 0.09, { to: 120, pan, wet: 0.05 });
+    noise(t, 0.035, 0.025, { ft: 'lowpass', f: 2600, pan, wet: 0.05 });
+  },
+  hard(pan, type, dist){
+    if (!ok()) return; const t = AC.currentTime, k = Math.min(1, dist / 14);
+    noise(t, 0.05 + 0.08 * k, 0.12, { ft: 'bandpass', f: 4500, fTo: 600, q: 0.9, pan, wet: 0.15 });
+    tone('sine', 170, t + 0.01, 0.32, 0.22, { to: 48, pan, wet: 0.1 });
+    noise(t + 0.01, 0.1, 0.09, { ft: 'bandpass', f: 900, fTo: 250, q: 1, pan, wet: 0.2 });
+    glassHit(PIECE_F[type] || 2000, t + 0.012, 0.07, { np: 5, dec: 0.75, pan, wet: 0.45 });
+    for (let i = 0; i < 3 + Math.round(3 * k); i++)
+      glassHit(rnd(3800, 7200), t + rnd(0.03, 0.2), rnd(0.006, 0.016), { np: 2, dec: rnd(0.04, 0.1), pan: pan + rnd(-0.4, 0.4), wet: 0.3 });
+  },
+  hold(){
+    if (!ok()) return; const t = AC.currentTime;
+    noise(t, 0.045, 0.24, { ft: 'bandpass', f: 1800, fTo: 8500, q: 1.4, wet: 0.5, a: 0.06 });
+    [0, 4, 7].forEach((s, i) => glassHit(2093 * 2 ** (s / 12), t + 0.03 + i * 0.04, 0.025, { np: 3, dec: 0.4, wet: 0.6, pan: -0.3 + i * 0.3 }));
+  },
+  crack(n, dur){
+    if (!ok()) return; const t = AC.currentTime, c = 3 + n * 2;
+    for (let i = 0; i < c; i++)
+      noise(t + Math.pow(i / c, 0.7) * dur, rnd(0.06, 0.14), 0.006, { f: rnd(4500, 8000), pan: rnd(-0.6, 0.6), wet: 0.15 });
+    tone('sine', rnd(2800, 3600), t, 0.012 + 0.004 * n, dur + 0.04, { to: rnd(5200, 6800), wet: 0.25, a: dur * 0.6 });
+  },
+  shatter(n, combo, pan, vol = 1){
+    if (!ok()) return; const t0 = AC.currentTime;
+    const pr = PROFILES[Math.floor(Math.random() * PROFILES.length)];
+    const base = pr.f * Math.pow(2, Math.min(combo, 10) / 24) * rnd(0.94, 1.06);
+    const rows = Math.min(n, 4);
+    for (let r = 0; r < rows; r++){
+      const t = t0 + r * 0.035, p = pan + rnd(-0.25, 0.25);
+      noise(t, (0.26 + 0.06 * n) * vol, 0.1 + 0.04 * n, { f: pr.nf, pan: p, wet: 0.3 });
+      noise(t, 0.22 * vol, 0.01, { f: 7500, pan: p, wet: 0.05 });
+      noise(t + 0.004, 0.12 * vol, 0.35 + 0.08 * n, { ft: 'bandpass', f: pr.bf, q: 2.5, pan: p, wet: 0.6 });
+      glassHit(base * rnd(0.97, 1.03) * (1 + r * 0.12), t, 0.07 * vol, { np: 5, dec: pr.dec, pan: p, wet: 0.7, click: false });
+    }
+    const span = 0.7 + 0.2 * n, k = 10 + n * 8;
+    for (let i = 0; i < k; i++){
+      const d = Math.pow(Math.random(), 1.6) * span;
+      glassHit(rnd(2600, 7800), t0 + 0.05 + d, rnd(0.008, 0.03) * vol * (1 - d / span * 0.6),
+        { np: 2, dec: rnd(0.05, 0.18), pan: rnd(-0.9, 0.9), wet: 0.45, click: Math.random() < 0.5 });
+    }
+    for (let i = 0; i < 4 + n * 3; i++) noise(t0 + rnd(0.35, span + 0.2), rnd(0.01, 0.03) * vol, 0.02, { f: 5000, pan: rnd(-0.8, 0.8), wet: 0.3 });
+    if (n >= 2) tone('sine', 110, t0, (0.12 + 0.07 * n) * vol, 0.4, { to: 38, wet: 0.15 });
+    if (n >= 3) noise(t0, 0.1 * vol, 0.8, { ft: 'lowpass', f: 600, fTo: 120, wet: 0.3 });
+    if (n >= 4){
+      noise(t0, 0.26, 1.6, { ft: 'bandpass', f: 1200, fTo: 9000, q: 0.8, wet: 0.8 });
+      tone('sine', 62, t0, 0.5, 1.0, { to: 28, wet: 0.3 });
+      [2093, 2637, 3136, 4186, 5274].forEach((f, i) => tone('sine', f * rnd(0.998, 1.002), t0 + 0.08 + i * 0.03, 0.03, 2.6, { wet: 0.95, dry: 0.6, a: 0.05, pan: -0.6 + i * 0.3 }));
+      duck(0.3, 0.35, 1.2);
+    } else if (n >= 2) duck(0.65, 0.1, 0.5);
+  },
+  debris(vol = 0.6){
+    if (!ok()) return; const t = AC.currentTime, p = rnd(-0.6, 0.6);
+    noise(t, 0.16 * vol, 0.14, { f: 2400, pan: p, wet: 0.35 });
+    for (let i = 0; i < 5; i++) glassHit(rnd(2400, 7000), t + rnd(0.02, 0.4), rnd(0.008, 0.02) * vol, { np: 2, dec: rnd(0.05, 0.15), pan: p + rnd(-0.3, 0.3), wet: 0.4 });
   },
   bell(combo){
     if (!ok()) return; const t = AC.currentTime + 0.04;
     const steps = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24, 26, 28];
-    const f = 1046.5 * Math.pow(2, steps[Math.min(combo, steps.length - 1)] / 12);
-    tone('sine', f, t, 0.08, 1.4, { wet: 0.8 }); tone('sine', f * 2.76, t, 0.025, 0.6, { wet: 0.8 }); tone('sine', f * 5.4, t, 0.01, 0.3, { wet: 0.8 });
+    const s = steps[Math.min(combo, steps.length - 1)], f = 1046.5 * Math.pow(2, s / 12);
+    glassHit(f, t, 0.07, { np: 4, dec: 1.6, wet: 0.85, click: false });
+    if (combo >= 2) glassHit(f * 1.5, t + 0.05, 0.035, { np: 3, dec: 1.2, wet: 0.85, click: false, pan: 0.4 });
+    if (combo >= 4) [0, 4, 7, 12].forEach((x, i) => glassHit(f * 2 ** (x / 12), t + 0.1 + i * 0.045, 0.02, { np: 2, dec: 0.6, wet: 0.8, click: false, pan: -0.5 + i * 0.33 }));
   },
-  level(){ if (!ok()) return; const t = AC.currentTime; [0, 4, 7, 12, 16].forEach((s, i) => tone('sine', 880 * 2 ** (s / 12), t + i * 0.07, 0.06, 0.9, { wet: 0.8 })); },
-  over(){ if (!ok()) return; const t = AC.currentTime; [12, 9, 7, 4, 2, 0, -5].forEach((s, i) => tone('sine', 880 * 2 ** (s / 12), t + i * 0.11, 0.06, 1.2, { wet: 0.9 })); }
+  level(){
+    if (!ok()) return; const t = AC.currentTime;
+    [0, 4, 7, 12, 16, 19].forEach((s, i) => glassHit(1046.5 * 2 ** (s / 12), t + i * 0.065, 0.05, { np: 4, dec: 1.2, wet: 0.8, pan: -0.5 + i * 0.2 }));
+    noise(t + 0.3, 0.05, 0.9, { ft: 'bandpass', f: 6000, fTo: 11000, q: 2, wet: 0.9, a: 0.2 });
+  },
+  perfect(){
+    if (!ok()) return; const t = AC.currentTime;
+    [0, 4, 7, 11, 12, 16, 19, 23, 24].forEach((s, i) => glassHit(783.99 * 2 ** (s / 12), t + i * 0.055, 0.05, { np: 4, dec: 1.8, wet: 0.85, pan: -0.8 + i * 0.2 }));
+    [1568, 1976, 2349, 3136].forEach((f, i) => tone('sine', f, t + 0.5, 0.03, 3.0, { wet: 0.95, a: 0.3, pan: -0.45 + i * 0.3 }));
+    duck(0.4, 0.6, 1.4);
+  },
+  creak(level){
+    if (!ok()) return; const t = AC.currentTime;
+    noise(t, 0.05 + 0.08 * level, 0.6, { ft: 'bandpass', f: rnd(260, 380), fTo: rnd(150, 210), q: 9, wet: 0.35, a: 0.12 });
+    glassHit(rnd(560, 820), t + 0.1, 0.012 + 0.02 * level, { np: 3, dec: 0.5, wet: 0.5, click: false });
+    if (Math.random() < 0.5) noise(t + rnd(0.15, 0.4), 0.05 * level, 0.005, { f: 6000, wet: 0.2 });
+  },
+  over(){
+    if (!ok()) return; const t = AC.currentTime;
+    noise(t, 0.3, 1.6, { ft: 'lowpass', f: 1800, fTo: 150, wet: 0.5 });
+    tone('sine', 90, t, 0.4, 1.2, { to: 30, wet: 0.3 });
+    [12, 9, 7, 4, 2, 0, -5].forEach((s, i) => glassHit(1760 * 2 ** (s / 12), t + 0.35 + i * 0.13, 0.045, { np: 3, dec: 1.4, wet: 0.9, pan: 0.6 - i * 0.2 }));
+  }
 };
 const buzz = ms => { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) {} };
 
@@ -535,13 +695,14 @@ function setPiece(t){
   const fr = m.findIndex(r => r.some(v => v));
   piece = { t, m, x: Math.floor((W - m.length) / 2), y: -fr, pop: 0, rp: 0 };
   pv.x = piece.x; pv.y = piece.y - 0.7;
-  lockT = 0; lockResets = 0; fallAcc = 0; phase = 'active';
+  lockT = 0; lockResets = 0; fallAcc = 0; phase = 'active'; SFX.spawn();
   if (collide(piece.m, piece.x, piece.y)) gameOver();
 }
 function spawn(){ holdUsed = false; setPiece(takeQueue()); }
 function groundReset(){ if (!canMove(0, 1) && lockResets < 15){ lockT = 0; lockResets++; } }
 function tryMove(dx, dy){
-  if (!piece || phase !== 'active' || !canMove(dx, dy)) return false;
+  if (!piece || phase !== 'active') return false;
+  if (!canMove(dx, dy)){ if (dx) SFX.bump(); return false; }
   piece.x += dx; piece.y += dy; groundReset(); SFX.move(); return true;
 }
 function rotatePiece(dir){
@@ -550,11 +711,11 @@ function rotatePiece(dir){
   const kicks = [[0,0],[-1,0],[1,0],[0,-1],[-1,-1],[1,-1],[-2,0],[2,0],[0,1]];
   for (const [kx, ky] of kicks){
     if (!collide(m2, piece.x + kx, piece.y + ky)){
-      piece.m = m2; piece.x += kx; piece.y += ky; piece.rp = 1; groundReset(); SFX.rotate(); return;
+      piece.m = m2; piece.x += kx; piece.y += ky; piece.rp = 1; groundReset(); SFX.rotate(dir); return;
     }
   }
 }
-function softStep(){ if (piece && phase === 'active' && canMove(0, 1)){ piece.y++; score += 1; fallAcc = 0; updateHUD(); } }
+function softStep(){ if (piece && phase === 'active' && canMove(0, 1)){ piece.y++; score += 1; fallAcc = 0; updateHUD(); SFX.tick(); } }
 function hardDrop(){
   if (!piece || phase !== 'active') return;
   let d = 0; while (canMove(0, d + 1)) d++;
@@ -566,7 +727,7 @@ function hardDrop(){
     }
   }
   piece.y += d; pv.y = piece.y; score += 2 * d;
-  SFX.hard(((piece.x + piece.m.length / 2) / W * 2 - 1) * 0.7);
+  SFX.hard(((piece.x + piece.m.length / 2) / W * 2 - 1) * 0.7, piece.t, d);
   shakeA += 0.1; buzz(12);
   lockPiece(true);
 }
@@ -578,7 +739,7 @@ function holdPiece(){
   holdUsed = true; SFX.hold();
 }
 function lockPiece(fromHard){
-  let top = false, sx = 0; const cells = cellsOf(piece);
+  let top = false, sx = 0; const cells = cellsOf(piece), lockType = piece.t;
   for (const [gx, gy] of cells){
     sx += gx;
     if (gy < 0){ top = true; continue; }
@@ -586,12 +747,12 @@ function lockPiece(fromHard){
     for (let k = 0; k < 2; k++) spark(cellX(gx) + rnd(-0.4, 0.4), cellY(gy) - 0.4, 0.45, rnd(-2, 2), rnd(0.5, 2.5), rnd(0, 2), rnd(0.07, 0.14), rnd(0.25, 0.5), WHITE, -4);
   }
   lastPan = ((sx / cells.length) / (W - 1) * 2 - 1) * 0.7;
-  if (!fromHard) SFX.lock(lastPan);
+  if (!fromHard) SFX.lock(lastPan, lockType);
   piece = null;
   if (top){ gameOver(); return; }
   const full = [];
   for (let r = 0; r < H; r++) if (grid[r].every(v => v)) full.push(r);
-  if (full.length){ clearingRows = full; phase = 'clearFlash'; phaseT = full.length >= 4 ? 0.12 : 0.07; }
+  if (full.length){ clearingRows = full; phase = 'clearFlash'; phaseT = full.length >= 4 ? 0.16 : 0.09; SFX.crack(full.length, phaseT); }
   else { combo = -1; phase = 'spawnDelay'; phaseT = 0.05; }
 }
 
@@ -646,7 +807,7 @@ function doClear(scoring){
     popup(names[Math.min(n, 4)], cy + 0.6, n >= 4 ? 'big' : '');
     popup('+' + pts.toLocaleString(), cy - 0.9, 'sub');
     if (combo > 0) popup('COMBO ×' + (combo + 1), cy + 2.2, 'combo');
-    if (empty){ const b = 2000 * level; score += b; setTimeout(() => popup('CRYSTAL CLEAR +' + b.toLocaleString(), 0, 'big combo'), 350); }
+    if (empty){ const b = 2000 * level; score += b; setTimeout(() => { popup('CRYSTAL CLEAR +' + b.toLocaleString(), 0, 'big combo'); SFX.perfect(); }, 350); }
     if (nl > level){ level = nl; setTimeout(() => { popup('LEVEL ' + level, 4, 'combo'); SFX.level(); }, 450); }
     updateHUD();
   } else {
@@ -664,7 +825,7 @@ function gameOver(){
   overRows = []; for (let r = H - 1; r >= 0; r--) if (grid[r].some(v => v)) overRows.push(r);
   overT = 0.3; newBest = score > best;
   if (newBest){ best = score; store.set('glassfall.best', best); }
-  SFX.over(); shakeA += 0.35; buzz([40, 60, 40]);
+  musicStop(2.2); SFX.over(); shakeA += 0.35; buzz([40, 60, 40]);
 }
 
 /* ---------------- title attract ---------------- */
@@ -703,7 +864,7 @@ function gameUpdate(dt){
   const interval = soft ? Math.min(gravInt(), 0.035) : gravInt();
   if (canMove(0, 1)){
     lockT = 0; fallAcc += dt;
-    while (fallAcc >= interval){ fallAcc -= interval; if (canMove(0, 1)){ piece.y++; if (soft){ score += 1; updateHUD(); } } else break; }
+    while (fallAcc >= interval){ fallAcc -= interval; if (canMove(0, 1)){ piece.y++; if (soft){ score += 1; updateHUD(); SFX.tick(); } } else break; }
   } else {
     fallAcc = 0; lockT += dt;
     if (lockT >= 0.5) lockPiece(false);
@@ -717,7 +878,7 @@ function overUpdate(dt){
         const r = overRows.shift(), y = cellY(r) + rowOff(r);
         for (let c = 0; c < W; c++) if (grid[r][c]) shatterCell(cellX(c), y, grid[r][c], 1, 6);
         grid[r] = new Uint8Array(W);
-        if (overRows.length % 2 === 0) SFX.shatter(1, 0, rnd(-0.5, 0.5), 0.55);
+        if (overRows.length % 2 === 0) SFX.debris(0.7);
         shakeA += 0.05; overT = 0.055;
       } else { phase = 'done'; overT = 0.8; }
     }
@@ -921,7 +1082,7 @@ function whiteFlash(){
 }
 const ICON_ON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/><path d="M19 6a8.5 8.5 0 0 1 0 12"/></svg>';
 const ICON_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor"/><path d="M17 9l5 6M22 9l-5 6"/></svg>';
-function syncMute(){ $('btnMute').innerHTML = muted ? ICON_OFF : ICON_ON; if (master) master.gain.value = muted ? 0 : 0.85; }
+function syncMute(){ $('btnMute').innerHTML = muted ? ICON_OFF : ICON_ON; if (out) out.gain.value = muted ? 0 : 1; }
 function show(id, on){ $(id).hidden = !on; }
 function setPlayUI(on){ ['hud', 'holdZone', 'holdTag', 'nextTag'].forEach(id => show(id, on)); }
 
@@ -930,6 +1091,7 @@ function startGame(){
   let any = false;
   for (let r = 0; r < H; r++) for (let c = 0; c < W; c++) if (grid[r][c]){ any = true; shatterCell(cellX(c), cellY(r) + rowOff(r), grid[r][c], 2, 4); }
   if (any){ SFX.shatter(3, 0, 0, 0.8); shakeA += 0.25; bgFlash = 0.6; }
+  SFX.start(); musicPlay(0);
   grid = makeGrid(); flash.fill(0); rowFrom.fill(0);
   score = 0; level = 1; lines = 0; combo = -1; holdType = 0; holdUsed = false; bag = []; queue = [];
   while (queue.length < 3) queue.push(nextType());
@@ -940,8 +1102,8 @@ function startGame(){
   perf.t = perf.f = perf.warm = 0;
   canvas.focus({ preventScroll: true });
 }
-function pauseGame(){ if (state !== 'play') return; state = 'pause'; soft = false; das.dir = 0; syncQualityButtons(); show('pauseScreen', true); }
-function resumeGame(){ if (state !== 'pause') return; initAudio(); state = 'play'; show('pauseScreen', false); }
+function pauseGame(){ if (state !== 'play') return; state = 'pause'; soft = false; das.dir = 0; musicPause(); syncQualityButtons(); show('pauseScreen', true); }
+function resumeGame(){ if (state !== 'pause') return; initAudio(); SFX.ui(); state = 'play'; musicResume(); show('pauseScreen', false); }
 function showOver(){
   $('finalScore').textContent = score.toLocaleString(); $('bestOver').textContent = best.toLocaleString();
   $('newRecord').hidden = !newBest; setPlayUI(false); show('overScreen', true);
@@ -952,10 +1114,10 @@ $('btnAgain').addEventListener('click', startGame);
 $('btnRestart').addEventListener('click', startGame);
 $('btnResume').addEventListener('click', resumeGame);
 $('btnPause').addEventListener('click', () => state === 'play' ? pauseGame() : resumeGame());
-$('btnMute').addEventListener('click', () => { muted = !muted; store.set('glassfall.muted', muted); initAudio(); syncMute(); });
+$('btnMute').addEventListener('click', () => { muted = !muted; store.set('glassfall.muted', muted); initAudio(); syncMute(); SFX.ui(); });
 $('holdZone').addEventListener('pointerdown', e => { e.preventDefault(); holdPiece(); });
 document.querySelectorAll('#qualityRow .seg').forEach(b => b.addEventListener('click', () => {
-  qualityPref = b.dataset.q; store.set('glassfall.quality', qualityPref);
+  qualityPref = b.dataset.q; store.set('glassfall.quality', qualityPref); SFX.ui();
   applyQuality(qualityPref === 'auto' ? 'high' : qualityPref);
 }));
 $('bestTitle').textContent = best.toLocaleString();
@@ -1025,7 +1187,7 @@ addEventListener('resize', layout);
 addEventListener('orientationchange', () => setTimeout(layout, 200));
 
 /* ---------------- loop ---------------- */
-let last = performance.now(), clock = 0;
+let last = performance.now(), clock = 0, creakT = 1.5;
 function frame(now){
   requestAnimationFrame(frame);
   const raw = Math.min(0.05, Math.max(0, (now - last) / 1000)); last = now; clock += raw;
@@ -1050,6 +1212,7 @@ function frame(now){
   const h = stackHeight();
   const target = state === 'play' ? Math.max(0, Math.min(1, (h - 12) / 4)) : 0;
   danger += (target - danger) * Math.min(1, raw * 3);
+  if (state === 'play' && danger > 0.25){ creakT -= raw; if (creakT <= 0){ SFX.creak(danger); creakT = rnd(2.6, 4) - danger * 1.4; } } else creakT = 1.5;
   bgFlash *= Math.exp(-raw * 4);
   bgMat.uniforms.uTime.value = clock; bgMat.uniforms.uDanger.value = danger; bgMat.uniforms.uFlash.value = bgFlash;
   frameMat.color.setRGB(1, 1 - danger * 0.35, 1 - danger * 0.2);
